@@ -10,40 +10,62 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
 	_ "github.com/go-sql-driver/mysql"
 )
 
 // Secret key for signing JWT
-var jwtKey = []byte("xxxx")
+var jwtKey = []byte("")
 
-// Struct for request body
+// Structs
 type User struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type UserData struct {
 	Name string `json:"name"`
 	Role string `json:"role"`
 	Age  int    `json:"age"`
 }
 
-// JWT claims structure
 type Claims struct {
 	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
 
-var db *sql.DB
+var usersDB, mydb *sql.DB
 
-// Initialize MySQL connection
+// Initialize MySQL connections
 func initDB() {
 	var err error
-	dsn := "dharineesh:@tcp(x.x.x.x:3306)/mydb"
-	db, err = sql.Open("mysql", dsn)
+
+	usersDB, err = sql.Open("mysql", "dharineesh:@tcp(192.168.x.x:3306)/logincredentials")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Users DB connection error:", err)
 	}
+
+	mydb, err = sql.Open("mysql", "dharineesh:@tcp(192.168.x.x:3306)/mydb")
+	if err != nil {
+		log.Fatal("MyDB connection error:", err)
+	}
+}
+
+// Password hashing function
+func hashPassword(password string) (string, error) {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return string(bytes), err
+}
+
+// Password verification function
+func checkPasswordHash(password, hash string) bool {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	return err == nil
 }
 
 // Generate JWT Token
 func GenerateToken(username string) (string, error) {
-	expirationTime := time.Now().Add(time.Second * 7) // Token expires in 1 hour
+	expirationTime := time.Now().Add(time.Hour * 1)
 	claims := &Claims{
 		Username: username,
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -55,29 +77,64 @@ func GenerateToken(username string) (string, error) {
 	return token.SignedString(jwtKey)
 }
 
-// Login Handler (POST Request)
-func LoginHandler(w http.ResponseWriter, r *http.Request) {
-	var creds map[string]string
+// Signup Handler (POST Request)
+func SignupHandler(w http.ResponseWriter, r *http.Request) {
+	var creds User
 	err := json.NewDecoder(r.Body).Decode(&creds)
 	if err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
 
-	// Dummy authentication (Replace with actual DB verification)
-	if creds["username"] != "admin" || creds["password"] != "password123" {
-		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+	// Hash the password
+	hashedPassword, err := hashPassword(creds.Password)
+	if err != nil {
+		http.Error(w, "Error hashing password", http.StatusInternalServerError)
+		return
+	}
+
+	// Store in users DB
+	_, err = usersDB.Exec("INSERT INTO users (username, password) VALUES (?, ?)", creds.Username, hashedPassword)
+	if err != nil {
+		http.Error(w, "Error storing user", http.StatusInternalServerError)
+		fmt.Print(err)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	w.Write([]byte("User registered successfully"))
+}
+
+// Login Handler (POST Request)
+func LoginHandler(w http.ResponseWriter, r *http.Request) {
+	var creds User
+	err := json.NewDecoder(r.Body).Decode(&creds)
+	if err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch hashed password from DB
+	var storedPassword string
+	err = usersDB.QueryRow("SELECT password FROM users WHERE username = ?", creds.Username).Scan(&storedPassword)
+	if err != nil {
+		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+		return
+	}
+
+	// Compare passwords
+	if !checkPasswordHash(creds.Password, storedPassword) {
+		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
 		return
 	}
 
 	// Generate token
-	token, err := GenerateToken(creds["username"])
+	token, err := GenerateToken(creds.Username)
 	if err != nil {
 		http.Error(w, "Error generating token", http.StatusInternalServerError)
 		return
 	}
 
-	// Respond with the token
 	json.NewEncoder(w).Encode(map[string]string{"token": token})
 }
 
@@ -102,26 +159,22 @@ func Authenticate(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Continue to next handler
 		next(w, r)
 	}
 }
 
-// Function to handle POST requests
-func addUserHandler(w http.ResponseWriter, r *http.Request) {
-	var user User
+// Add User Handler (JWT protected, inserts into `mydb`)
+func AddUserHandler(w http.ResponseWriter, r *http.Request) {
+	var user UserData
 	err := json.NewDecoder(r.Body).Decode(&user)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
 
-	// Insert data into MySQL database
-	query := "INSERT INTO users (name, role, age) VALUES (?, ?, ?)"
-	_, err = db.Exec(query, user.Name, user.Role, user.Age)
+	_, err = mydb.Exec("INSERT INTO users (name, role, age) VALUES (?, ?, ?)", user.Name, user.Role, user.Age)
 	if err != nil {
-		log.Printf("Error executing query: %v", err)
-		http.Error(w, "Error inserting data into DB", http.StatusInternalServerError)
+		http.Error(w, "Error inserting data", http.StatusInternalServerError)
 		return
 	}
 
@@ -129,19 +182,14 @@ func addUserHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("User added successfully"))
 }
 
-// Secure Handler
-func SecureHandler(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("Authenticated user can access this!"))
-}
-
-// Main function to start the server
 func main() {
 	initDB()
-	defer db.Close()
+	defer usersDB.Close()
+	defer mydb.Close()
 
-	http.HandleFunc("/adduser", Authenticate(addUserHandler))
+	http.HandleFunc("/signup", SignupHandler)
 	http.HandleFunc("/login", LoginHandler)
-	http.HandleFunc("/secure-data", Authenticate(SecureHandler))
+	http.HandleFunc("/adduser", Authenticate(AddUserHandler))
 
 	fmt.Println("Server is running on port 8080...")
 	err := http.ListenAndServe(":8080", nil)
